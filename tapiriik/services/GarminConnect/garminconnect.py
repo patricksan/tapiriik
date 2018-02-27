@@ -23,6 +23,7 @@ import json
 import re
 import random
 import tempfile
+import json
 from urllib.parse import urlencode
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,10 @@ class GarminConnectService(ServiceBase):
     PartialSyncRequiresTrigger = len(GARMIN_CONNECT_USER_WATCH_ACCOUNTS) > 0
     PartialSyncTriggerPollInterval = timedelta(minutes=20)
     PartialSyncTriggerPollMultiple = len(GARMIN_CONNECT_USER_WATCH_ACCOUNTS.keys())
+    # +1 from default due to my embarrassing inability to...
+    # a) create a reasonable schema to allow for these updates.
+    # b) write a query to reset the counters in the existing schema.
+    DownloadRetryCount = 6
 
     ConfigurationDefaults = {
         "WatchUserKey": None,
@@ -56,7 +61,9 @@ class GarminConnectService(ServiceBase):
                                 "rowing": ActivityType.Rowing,
                                 "elliptical": ActivityType.Elliptical,
                                 "fitness_equipment": ActivityType.Gym,
+                                "rock_climbing": ActivityType.Climbing,
                                 "mountaineering": ActivityType.Climbing,
+                                "strength_training": ActivityType.StrengthTraining,
                                 "all": ActivityType.Other,  # everything will eventually resolve to this
                                 "multi_sport": ActivityType.Other # Most useless type? You decide!
     }
@@ -74,7 +81,8 @@ class GarminConnectService(ServiceBase):
                                 "rowing": ActivityType.Rowing,
                                 "elliptical": ActivityType.Elliptical,
                                 "fitness_equipment": ActivityType.Gym,
-                                "mountaineering": ActivityType.Climbing,
+                                "rock_climbing": ActivityType.Climbing,
+                                "strength_training": ActivityType.StrengthTraining,
                                 "other": ActivityType.Other  # I guess? (vs. "all" that is)
     }
 
@@ -85,6 +93,7 @@ class GarminConnectService(ServiceBase):
     SupportsActivityDeletion = True
 
     _sessionCache = SessionCache("garminconnect", lifetime=timedelta(minutes=120), freshen_on_get=True)
+    _reauthAttempts = 1 # per request
 
     _unitMap = {
         "mph": ActivityStatisticUnit.MilesPerHour,
@@ -145,6 +154,16 @@ class GarminConnectService(ServiceBase):
         finally:
             fcntl.flock(self._rate_lock,fcntl.LOCK_UN)
 
+    def _request_with_reauth(self, req_lambda, serviceRecord=None, email=None, password=None):
+        for i in range(self._reauthAttempts + 1):
+            session = self._get_session(record=serviceRecord, email=email, password=password, skip_cache=i > 0)
+            self._rate_limit()
+            result = req_lambda(session)
+            if result.status_code not in (403, 500):
+                return result
+        # Pass the failed response back any ways - another handler will catch it and provide a nicer error
+        return result
+
     def _get_session(self, record=None, email=None, password=None, skip_cache=False):
         from tapiriik.auth.credential_storage import CredentialStore
         cached = self._sessionCache.Get(record.ExternalID if record else email)
@@ -174,7 +193,7 @@ class GarminConnectService(ServiceBase):
             # "redirectAfterAccountCreationUrl": "http://connect.garmin.com/post-auth/login",
             # "webhost": "olaxpw-connect00.garmin.com",
             "clientId": "GarminConnect",
-            # "gauthHost": "https://sso.garmin.com/sso",
+            "gauthHost": "https://sso.garmin.com/sso",
             # "rememberMeShown": "true",
             # "rememberMeChecked": "false",
             "consumeServiceTicket": "false",
@@ -193,38 +212,45 @@ class GarminConnectService(ServiceBase):
         preResp = session.get("https://sso.garmin.com/sso/login", params=params)
         if preResp.status_code != 200:
             raise APIException("SSO prestart error %s %s" % (preResp.status_code, preResp.text))
-        data["lt"] = re.search("name=\"lt\"\s+value=\"([^\"]+)\"", preResp.text).groups(1)[0]
 
         ssoResp = session.post("https://sso.garmin.com/sso/login", params=params, data=data, allow_redirects=False)
         if ssoResp.status_code != 200 or "temporarily unavailable" in ssoResp.text:
             raise APIException("SSO error %s %s" % (ssoResp.status_code, ssoResp.text))
 
-        ticket_match = re.search("ticket=([^']+)'", ssoResp.text)
-        if not ticket_match:
+        if ">sendEvent('FAIL')" in ssoResp.text:
             raise APIException("Invalid login", block=True, user_exception=UserException(UserExceptionType.Authorization, intervention_required=True))
-        ticket = ticket_match.groups(1)[0]
+        if ">sendEvent('ACCOUNT_LOCKED')" in ssoResp.text:
+            raise APIException("Account Locked", block=True, user_exception=UserException(UserExceptionType.Locked, intervention_required=True))
+
+        if "renewPassword" in ssoResp.text:
+            raise APIException("Reset password", block=True, user_exception=UserException(UserExceptionType.RenewPassword, intervention_required=True))
 
         # ...AND WE'RE NOT DONE YET!
 
         self._rate_limit()
-        gcRedeemResp = session.get("https://connect.garmin.com/post-auth/login", params={"ticket": ticket}, allow_redirects=False)
+        gcRedeemResp = session.get("https://connect.garmin.com/post-auth/login", allow_redirects=False)
         if gcRedeemResp.status_code != 302:
             raise APIException("GC redeem-start error %s %s" % (gcRedeemResp.status_code, gcRedeemResp.text))
-
+        url_prefix = "https://connect.garmin.com"
         # There are 6 redirects that need to be followed to get the correct cookie
         # ... :(
-        expected_redirect_count = 6
+        max_redirect_count = 7
         current_redirect_count = 1
         while True:
             self._rate_limit()
-            gcRedeemResp = session.get(gcRedeemResp.headers["location"], allow_redirects=False)
+            url = gcRedeemResp.headers["location"]
+            # Fix up relative redirects.
+            if url.startswith("/"):
+                url = url_prefix + url
+            url_prefix = "/".join(url.split("/")[:3])
+            gcRedeemResp = session.get(url, allow_redirects=False)
 
-            if current_redirect_count >= expected_redirect_count and gcRedeemResp.status_code != 200:
-                raise APIException("GC redeem %d/%d error %s %s" % (current_redirect_count, expected_redirect_count, gcRedeemResp.status_code, gcRedeemResp.text))
+            if current_redirect_count >= max_redirect_count and gcRedeemResp.status_code != 200:
+                raise APIException("GC redeem %d/%d error %s %s" % (current_redirect_count, max_redirect_count, gcRedeemResp.status_code, gcRedeemResp.text))
             if gcRedeemResp.status_code == 200 or gcRedeemResp.status_code == 404:
                 break
             current_redirect_count += 1
-            if current_redirect_count > expected_redirect_count:
+            if current_redirect_count > max_redirect_count:
                 break
 
         self._sessionCache.Set(record.ExternalID if record else email, session)
@@ -261,25 +287,15 @@ class GarminConnectService(ServiceBase):
 
     def DownloadActivityList(self, serviceRecord, exhaustive=False):
         #http://connect.garmin.com/proxy/activity-search-service-1.0/json/activities?&start=0&limit=50
-        session = self._get_session(record=serviceRecord)
         page = 1
         pageSz = 100
         activities = []
         exclusions = []
         while True:
             logger.debug("Req with " + str({"start": (page - 1) * pageSz, "limit": pageSz}))
-            self._rate_limit()
 
-            retried_auth = False
-            while True:
-                res = session.get("https://connect.garmin.com/modern/proxy/activity-search-service-1.0/json/activities", params={"start": (page - 1) * pageSz, "limit": pageSz})
-                # It's 10 PM and I have no clue why it's throwing these errors, maybe we just need to log in again?
-                if res.status_code in [500, 403] and not retried_auth:
-                    logger.debug("Retrying auth w/o cache")
-                    retried_auth = True
-                    session = self._get_session(serviceRecord, skip_cache=True)
-                else:
-                    break
+            res = self._request_with_reauth(lambda session: session.get("https://connect.garmin.com/modern/proxy/activity-search-service-1.0/json/activities", params={"start": (page - 1) * pageSz, "limit": pageSz}), serviceRecord)
+
             try:
                 res = res.json()["results"]
             except ValueError:
@@ -350,68 +366,64 @@ class GarminConnectService(ServiceBase):
 
     def _downloadActivitySummary(self, serviceRecord, activity):
         activityID = activity.ServiceData["ActivityID"]
-        session = self._get_session(record=serviceRecord)
-        self._rate_limit()
-        res = session.get("https://connect.garmin.com/modern/proxy/activity-service-1.3/json/activity/" + str(activityID))
+
+        summary_resp = self._request_with_reauth(lambda session: session.get("https://connect.garmin.com/modern/proxy/activity-service/activity/" + str(activityID)), serviceRecord)
 
         try:
-            raw_data = res.json()
+            summary_data = summary_resp.json()
         except ValueError:
-            raise APIException("Failure downloading activity summary %s:%s" % (res.status_code, res.text))
+            raise APIException("Failure downloading activity summary %s:%s" % (summary_resp.status_code, summary_resp.text))
         stat_map = {}
-        def mapStat(gcKey, statKey, type):
+
+
+        def mapStat(gcKey, statKey, type, units):
             stat_map[gcKey] = {
                 "key": statKey,
-                "attr": type
+                "attr": type,
+                "units": units
             }
 
         def applyStats(gc_dict, stats_obj):
             for gc_key, stat in stat_map.items():
                 if gc_key in gc_dict:
-                    value = float(gc_dict[gc_key]["value"])
-                    units = self._unitMap[gc_dict[gc_key]["uom"]]
+                    value = float(gc_dict[gc_key])
                     if math.isinf(value):
                         continue # GC returns the minimum speed as "-Infinity" instead of 0 some times :S
-                    getattr(stats_obj, stat["key"]).update(ActivityStatistic(units, **({stat["attr"]: value})))
+                    getattr(stats_obj, stat["key"]).update(ActivityStatistic(stat["units"], **({stat["attr"]: value})))
 
-        mapStat("SumMovingDuration", "MovingTime", "value")
-        mapStat("SumDuration", "TimerTime", "value")
-        mapStat("SumDistance", "Distance", "value")
-        mapStat("MinSpeed", "Speed", "min")
-        mapStat("MaxSpeed", "Speed", "max")
-        mapStat("WeightedMeanSpeed", "Speed", "avg")
-        mapStat("MinAirTemperature", "Temperature", "min")
-        mapStat("MaxAirTemperature", "Temperature", "max")
-        mapStat("WeightedMeanAirTemperature", "Temperature", "avg")
-        mapStat("SumEnergy", "Energy", "value")
-        mapStat("MaxHeartRate", "HR", "max")
-        mapStat("WeightedMeanHeartRate", "HR", "avg")
-        mapStat("MaxDoubleCadence", "RunCadence", "max")
-        mapStat("WeightedMeanDoubleCadence", "RunCadence", "avg")
-        mapStat("MaxBikeCadence", "Cadence", "max")
-        mapStat("WeightedMeanBikeCadence", "Cadence", "avg")
-        mapStat("MinPower", "Power", "min")
-        mapStat("MaxPower", "Power", "max")
-        mapStat("WeightedMeanPower", "Power", "avg")
-        mapStat("MinElevation", "Elevation", "min")
-        mapStat("MaxElevation", "Elevation", "max")
-        mapStat("GainElevation", "Elevation", "gain")
-        mapStat("LossElevation", "Elevation", "loss")
+        mapStat("movingDuration", "MovingTime", "value", ActivityStatisticUnit.Seconds)
+        mapStat("duration", "TimerTime", "value", ActivityStatisticUnit.Seconds)
+        mapStat("distance", "Distance", "value", ActivityStatisticUnit.Meters)
+        mapStat("maxSpeed", "Speed", "max", ActivityStatisticUnit.MetersPerSecond)
+        mapStat("averageSpeed", "Speed", "avg", ActivityStatisticUnit.MetersPerSecond)
+        mapStat("calories", "Energy", "value", ActivityStatisticUnit.Kilocalories)
+        mapStat("maxHR", "HR", "max", ActivityStatisticUnit.BeatsPerMinute)
+        mapStat("averageHR", "HR", "avg", ActivityStatisticUnit.BeatsPerMinute)
+        mapStat("minElevation", "Elevation", "min", ActivityStatisticUnit.Meters)
+        mapStat("maxElevation", "Elevation", "max", ActivityStatisticUnit.Meters)
+        mapStat("elevationGain", "Elevation", "gain", ActivityStatisticUnit.Meters)
+        mapStat("elevationLoss", "Elevation", "loss", ActivityStatisticUnit.Meters)
+        mapStat("averageBikeCadence", "Cadence", "avg", ActivityStatisticUnit.RevolutionsPerMinute)
+        mapStat("averageCadence", "Cadence", "avg", ActivityStatisticUnit.StepsPerMinute)
 
-        applyStats(raw_data["activity"]["activitySummary"], activity.Stats)
+        applyStats(summary_data["summaryDTO"], activity.Stats)
 
-        for lap_data in raw_data["activity"]["totalLaps"]["lapSummaryList"]:
+        laps_resp = self._request_with_reauth(lambda session: session.get("https://connect.garmin.com/modern/proxy/activity-service/activity/%s/splits" % str(activityID)), serviceRecord)
+        try:
+            laps_data = laps_resp.json()
+        except ValueError:
+            raise APIException("Failure downloading activity laps summary %s:%s" % (laps_resp.status_code, laps_resp.text))
+
+        for lap_data in laps_data["lapDTOs"]:
             lap = Lap()
-            if "BeginTimestamp" in lap_data:
-                lap.StartTime = pytz.utc.localize(datetime.utcfromtimestamp(float(lap_data["BeginTimestamp"]["value"]) / 1000))
-            if "EndTimestamp" in lap_data:
-                lap.EndTime = pytz.utc.localize(datetime.utcfromtimestamp(float(lap_data["EndTimestamp"]["value"]) / 1000))
+            if "startTimeGMT" in lap_data:
+                lap.StartTime = pytz.utc.localize(datetime.strptime(lap_data["startTimeGMT"], "%Y-%m-%dT%H:%M:%S.0"))
 
             elapsed_duration = None
-            if "SumElapsedDuration" in lap_data:
-                elapsed_duration = timedelta(seconds=round(float(lap_data["SumElapsedDuration"]["value"])))
-            elif "SumDuration" in lap_data:
-                elapsed_duration = timedelta(seconds=round(float(lap_data["SumDuration"]["value"])))
+            if "elapsedDuration" in lap_data:
+                elapsed_duration = timedelta(seconds=round(float(lap_data["elapsedDuration"])))
+            elif "duration" in lap_data:
+                elapsed_duration = timedelta(seconds=round(float(lap_data["duration"])))
 
             if lap.StartTime and elapsed_duration:
                 # Always recalculate end time based on duration, if we have the start time
@@ -444,9 +456,7 @@ class GarminConnectService(ServiceBase):
 
         # https://connect.garmin.com/proxy/activity-service-1.3/json/activityDetails/####
         activityID = activity.ServiceData["ActivityID"]
-        session = self._get_session(record=serviceRecord)
-        self._rate_limit()
-        res = session.get("https://connect.garmin.com/modern/proxy/activity-service-1.3/json/activityDetails/" + str(activityID) + "?maxSize=999999999")
+        res = self._request_with_reauth(lambda session: session.get("https://connect.garmin.com/modern/proxy/activity-service-1.3/json/activityDetails/" + str(activityID) + "?maxSize=999999999"), serviceRecord)
         try:
             raw_data = res.json()["com.garmin.activity.details.json.ActivityDetails"]
         except ValueError:
@@ -479,7 +489,6 @@ class GarminConnectService(ServiceBase):
 
         # Figure out which metrics we'll be seeing in this activity
         attrs_indexed = {}
-        attr_count = len(raw_data["measurements"])
         for measurement in raw_data["measurements"]:
             key = measurement["key"]
             if key in attrs_map:
@@ -531,10 +540,16 @@ class GarminConnectService(ServiceBase):
         #/proxy/upload-service-1.1/json/upload/.fit
         fit_file = FITIO.Dump(activity)
         files = {"data": ("tap-sync-" + str(os.getpid()) + "-" + activity.UID + ".fit", fit_file)}
-        session = self._get_session(record=serviceRecord)
-        self._rate_limit()
-        res = session.post("https://connect.garmin.com/proxy/upload-service-1.1/json/upload/.fit", files=files)
-        res = res.json()["detailedImportResult"]
+
+        res = self._request_with_reauth(
+            lambda session: session.post("https://connect.garmin.com/modern/proxy/upload-service/upload/.fit",
+                                         files=files,
+                                         headers={"nk": "NT"}),
+            serviceRecord)
+        try:
+            res = res.json()["detailedImportResult"]
+        except ValueError:
+            raise APIException("Bad response during GC upload: %s %s" % (res.status_code, res.text))
 
         if len(res["successes"]) == 0:
             if len(res["failures"]) and len(res["failures"][0]["messages"]) and res["failures"][0]["messages"][0]["content"] == "Duplicate activity":
@@ -547,62 +562,31 @@ class GarminConnectService(ServiceBase):
 
         name = activity.Name # Capture in logs
         notes = activity.Notes
-        encoding_headers = {"Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"} # GC really, really needs this part, otherwise it throws obscure errors like "Invalid signature for signature method HMAC-SHA1"
-        warnings = []
-        try:
-            if activity.Name and activity.Name.strip():
-                self._rate_limit()
-                res = session.post("https://connect.garmin.com/proxy/activity-service-1.2/json/name/" + str(actid), data=urlencode({"value": activity.Name}).encode("UTF-8"), headers=encoding_headers)
-                try:
-                    res = res.json()
-                except:
-                    raise APIWarning("Activity name request failed - %s" % res.text)
-                if "display" not in res or res["display"]["value"] != activity.Name:
-                    raise APIWarning("Unable to set activity name")
-        except APIWarning as e:
-            warnings.append(e)
 
-        try:
-            if activity.Notes and activity.Notes.strip():
-                self._rate_limit()
-                res = session.post("https://connect.garmin.com/proxy/activity-service-1.2/json/description/" + str(actid), data=urlencode({"value": activity.Notes}).encode("UTF-8"), headers=encoding_headers)
-                try:
-                    res = res.json()
-                except:
-                    raise APIWarning("Activity notes request failed - %s" % res.text)
-                if "display" not in res or res["display"]["value"] != activity.Notes:
-                    raise APIWarning("Unable to set activity notes")
-        except APIWarning as e:
-            warnings.append(e)
+        # Update activity metadata not included in the FIT file.
+        metadata_object = {}
+        if activity.Name and activity.Name.strip():
+            metadata_object["activityName"] = activity.Name
+        if activity.Notes and activity.Notes.strip():
+            metadata_object["description"] = activity.Notes
+        if activity.Type not in [ActivityType.Running, ActivityType.Cycling, ActivityType.Other]:
+            # Set the legit activity type - whatever it is, it's not supported by the FIT schema
+            acttype = [k for k, v in self._reverseActivityMappings.items() if v == activity.Type]
+            if len(acttype) == 0:
+                raise APIWarning("GarminConnect does not support activity type " + activity.Type)
+            else:
+                acttype = acttype[0]
+            metadata_object["activityTypeDTO"] = {"typeKey": acttype}
+        if activity.Private:
+            metadata_object["accessControlRuleDTO"] = {"typeKey": "private"}
 
-        try:
-            if activity.Type not in [ActivityType.Running, ActivityType.Cycling, ActivityType.Other]:
-                # Set the legit activity type - whatever it is, it's not supported by the TCX schema
-                acttype = [k for k, v in self._reverseActivityMappings.items() if v == activity.Type]
-                if len(acttype) == 0:
-                    raise APIWarning("GarminConnect does not support activity type " + activity.Type)
-                else:
-                    acttype = acttype[0]
-                self._rate_limit()
-                res = session.post("https://connect.garmin.com/proxy/activity-service-1.2/json/type/" + str(actid), data={"value": acttype})
-                res = res.json()
-                if "activityType" not in res or res["activityType"]["key"] != acttype:
-                    raise APIWarning("Unable to set activity type")
-        except APIWarning as e:
-            warnings.append(e)
+        if metadata_object:
+            metadata_object["activityId"] = actid
+            encoding_headers = {"Content-Type": "application/json; charset=UTF-8"} # GC really, really needs this part, otherwise it throws obscure errors like "Invalid signature for signature method HMAC-SHA1"
+            res = self._request_with_reauth(lambda session: session.put("https://connect.garmin.com/proxy/activity-service/activity/" + str(actid), data=json.dumps(metadata_object), headers=encoding_headers), serviceRecord)
+            if res.status_code != 204:
+                raise APIWarning("Unable to set activity metadata - %d %s" % (res.status_code, res.text))
 
-        try:
-            if activity.Private:
-                self._rate_limit()
-                res = session.post("https://connect.garmin.com/proxy/activity-service-1.2/json/privacy/" + str(actid), data={"value": "private"})
-                res = res.json()
-                if "definition" not in res or res["definition"]["key"] != "private":
-                    raise APIWarning("Unable to set activity privacy")
-        except APIWarning as e:
-            warnings.append(e)
-
-        if len(warnings):
-            raise APIWarning(str(warnings)) # Meh
         return actid
 
     def _user_watch_user(self, serviceRecord):
@@ -667,17 +651,33 @@ class GarminConnectService(ServiceBase):
         # First, accept any pending connections
         watch_user_key = sorted(list(GARMIN_CONNECT_USER_WATCH_ACCOUNTS.keys()))[multiple_index]
         watch_user = GARMIN_CONNECT_USER_WATCH_ACCOUNTS[watch_user_key]
-        session = self._get_session(email=watch_user["Username"], password=watch_user["Password"], skip_cache=True)
+        logger.debug("Initiating session for watch user %s", watch_user["Username"])
+        sess_args = {
+            "email": watch_user["Username"],
+            "password": watch_user["Password"]
+        }
 
+        # These seems to fail with a 500 (talkking about a timeout) the first time, so keep trying.
+        SERVER_ERROR_RETRIES = 10
+        PAGE_SIZE = 100
+        TOTAL_SIZE = 1000
         # Then, check for users with new activities
-        self._rate_limit()
-        watch_activities_resp = session.get("https://connect.garmin.com/modern/proxy/activitylist-service/activities/subscriptionFeed?limit=1000")
-        try:
-            watch_activities = watch_activities_resp.json()
-        except ValueError:
-            raise Exception("Could not parse new activities list: %s %s" % (watch_activities_resp.status_code, watch_activities_resp.text))
+        watch_activities = []
+        for i in range(1, TOTAL_SIZE, PAGE_SIZE):
+            for x in range(SERVER_ERROR_RETRIES):
+                logger.debug("Fetching activity list from %d - attempt %d", i, x)
+                watch_activities_resp = self._request_with_reauth(
+                    lambda session: session.get("https://connect.garmin.com/modern/proxy/activitylist-service/activities/subscriptionFeed",
+                                                params={"limit": PAGE_SIZE, "start": i}),
+                    **sess_args)
+                if watch_activities_resp.status_code != 500:
+                    break
+            try:
+                watch_activities += watch_activities_resp.json()["activityList"]
+            except ValueError:
+                raise Exception("Could not parse new activities list: %s %s" % (watch_activities_resp.status_code, watch_activities_resp.text))
 
-        active_user_pairs = [(x["ownerDisplayName"], x["activityId"]) for x in watch_activities["activityList"]]
+        active_user_pairs = [(x["ownerDisplayName"], x["activityId"]) for x in watch_activities]
         active_user_pairs.sort(key=lambda x: x[1]) # Highest IDs last (so they make it into the dict, supplanting lower IDs where appropriate)
         active_users = dict(active_user_pairs)
 
@@ -694,8 +694,14 @@ class GarminConnectService(ServiceBase):
                 to_sync_ids.append(active_user_rec.ExternalID)
                 active_user_rec.SetConfiguration({"WatchUserLastID": this_active_id, "WatchUserKey": watch_user_key})
 
-        self._rate_limit()
-        pending_connections_resp = session.get("https://connect.garmin.com/modern/proxy/userprofile-service/connection/pending")
+        for x in range(SERVER_ERROR_RETRIES):
+            self._rate_limit()
+            logger.debug("Fetching connection request list - attempt %d", x)
+            pending_connections_resp = self._request_with_reauth(
+                lambda session: session.get("https://connect.garmin.com/modern/proxy/userprofile-service/connection/pending"),
+                **sess_args)
+            if pending_connections_resp.status_code != 500:
+                break
         try:
             pending_connections = pending_connections_resp.json()
         except ValueError:
@@ -706,13 +712,16 @@ class GarminConnectService(ServiceBase):
             for pending_connect in pending_connections:
                 if pending_connect["displayName"] in valid_pending_connections_external_ids:
                     self._rate_limit()
-                    connect_resp = session.put("https://connect.garmin.com/modern/proxy/userprofile-service/connection/accept/%s" % pending_connect["connectionRequestId"])
+                    connect_resp = self._request_with_reauth(
+                        lambda session: session.put("https://connect.garmin.com/modern/proxy/userprofile-service/connection/accept/%s" % pending_connect["connectionRequestId"]),
+                        **sess_args)
                     if connect_resp.status_code != 200:
                         logger.error("Error accepting request on watch account %s: %s %s" % (watch_user["Name"], connect_resp.status_code, connect_resp.text))
                 else:
                     self._rate_limit()
-                    ignore_resp = session.put("https://connect.garmin.com/modern/proxy/userprofile-service/connection/decline/%s" % pending_connect["connectionRequestId"])
-
+                    self._request_with_reauth(
+                        lambda session: session.put("https://connect.garmin.com/modern/proxy/userprofile-service/connection/decline/%s" % pending_connect["connectionRequestId"]),
+                        **sess_args)
 
         return to_sync_ids
 

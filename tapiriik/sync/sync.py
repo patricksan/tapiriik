@@ -4,9 +4,9 @@ from tapiriik.services import Service, ServiceRecord, APIExcludeActivity, Servic
 from tapiriik.settings import USER_SYNC_LOGS, DISABLED_SERVICES, WITHDRAWN_SERVICES
 from .activity_record import ActivityRecord, ActivityServicePrescence
 from datetime import datetime, timedelta
-from pymongo.read_preferences import ReadPreference
 import sys
 import os
+import io
 import socket
 import traceback
 import pprint
@@ -14,18 +14,24 @@ import copy
 import random
 import logging
 import logging.handlers
+import pymongo
 import pytz
 import kombu
 import json
+import bisect
 
-# Set this up seperate from the logger used in this scope, so services logging messages are caught and logged into user's files.
+# Set this up separate from the logger used in this scope, so services logging messages are caught and logged into user's files.
 _global_logger = logging.getLogger("tapiriik")
 
 _global_logger.setLevel(logging.DEBUG)
-logging_console_handler = logging.StreamHandler(sys.stdout)
-logging_console_handler.setLevel(logging.DEBUG)
-logging_console_handler.setFormatter(logging.Formatter('%(message)s'))
-_global_logger.addHandler(logging_console_handler)
+
+# In celery tasks, sys.stdout has already been monkeypatched
+# So we'll assume they know what they're doing.
+if hasattr(sys.stdout, "buffer"):
+    logging_console_handler = logging.StreamHandler(io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8'))
+    logging_console_handler.setLevel(logging.DEBUG)
+    logging_console_handler.setFormatter(logging.Formatter('%(message)s'))
+    _global_logger.addHandler(logging_console_handler)
 
 logger = logging.getLogger("tapiriik.sync.worker")
 
@@ -58,6 +64,9 @@ def _packServiceException(step, e):
     if e.UserException:
         res["UserException"] = _packUserException(e.UserException)
     return res
+
+def _packException(step):
+    return {"Step": step, "Message": _formatExc(), "Timestamp": datetime.utcnow()}
 
 def _packUserException(userException):
     if userException:
@@ -129,7 +138,7 @@ class Sync:
             logger.warning("Could not find user %s - bailing" % user_id)
             message.ack() # Otherwise the entire thing grinds to a halt
             return
-        if body["generation"] != user["QueuedGeneration"]:
+        if body["generation"] != user.get("QueuedGeneration", None):
             # QueuedGeneration being different means they've gone through sync_scheduler since this particular message was queued
             # So, discard this and wait for that message to surface
             # Should only happen when I manually requeue people
@@ -166,23 +175,29 @@ class Sync:
                     logger.info("Not scheduling auto sync for paid user")
                 else:
                     nextSync = datetime.utcnow() + Sync.SyncInterval + timedelta(seconds=random.randint(-Sync.SyncIntervalJitter.total_seconds(), Sync.SyncIntervalJitter.total_seconds()))
-            if result:
-                if result.ForceNextSync:
-                    logger.info("Forcing next sync at %s" % result.ForceNextSync)
-                    nextSync = result.ForceNextSync
+            if result and result.ForceNextSync:
+                logger.info("Forcing next sync at %s" % result.ForceNextSync)
+                nextSync = result.ForceNextSync
+            reschedule_update = {
+                "$set": {
+                    "NextSynchronization": nextSync,
+                    "LastSynchronization": datetime.utcnow(),
+                    "LastSynchronizationVersion": version
+                }, "$unset": {
+                    "QueuedAt": None # Set by sync_scheduler when the record enters the MQ
+                }
+            }
+
+            if result and result.ForceExhaustive:
+                logger.info("Forcing next sync as exhaustive")
+                reschedule_update["$set"]["NextSyncIsExhaustive"] = True
+            else:
+                reschedule_update["$unset"]["NextSyncIsExhaustive"] = ""
+
             scheduling_result = db.users.update(
                 {
                     "_id": user["_id"]
-                }, {
-                    "$set": {
-                        "NextSynchronization": nextSync,
-                        "LastSynchronization": datetime.utcnow(),
-                        "LastSynchronizationVersion": version
-                    }, "$unset": {
-                        "NextSyncIsExhaustive": None,
-                        "QueuedAt": None # Set by sync_scheduler when the record enters the MQ
-                    }
-                })
+                }, reschedule_update)
             reschedule_confirm_message = "User reschedule for %s returned %s" % (nextSync, scheduling_result)
 
             # Tack this on the end of the log file since otherwise it's lost for good (blegh, but nicer than moving logging out of the sync task?)
@@ -282,7 +297,15 @@ class SynchronizationTask:
                 # Only reset the trigger if we succesfully got through the entire sync without bailing on this particular connection
                 update_values["$unset"] = {"TriggerPartialSync": None}
 
-            db.connections.update({"_id": conn._id}, update_values)
+            try:
+                db.connections.update({"_id": conn._id}, update_values)
+            except pymongo.errors.WriteError as e:
+                if e.code == 17419: # Update makes document too large.
+                    # Throw them all out - exhaustive sync will recover whichever still apply.
+                    # NB we don't explicitly mark as exhaustive here, the error counts will trigger it if appropriate.
+                    db.connections.update({"_id": conn._id}, {"$unset": {"SyncErrors": "", "ExcludedActivities": ""}})
+                else:
+                    raise
             nonblockingSyncErrorsCount += len([x for x in self._syncErrors[conn._id] if "Block" not in x or not x["Block"]])
             blockingSyncErrorsCount += len([x for x in self._syncErrors[conn._id] if "Block" in x and x["Block"]])
             forcingExhaustiveSyncErrorsCount += len([x for x in self._syncErrors[conn._id] if "Block" in x and x["Block"] and "TriggerExhaustive" in x and x["TriggerExhaustive"]])
@@ -419,7 +442,7 @@ class SynchronizationTask:
     def _accumulateActivities(self, conn, svcActivities, no_add=False):
         # Yep, abs() works on timedeltas
         activityStartLeeway = timedelta(minutes=3)
-        activityStartTZOffsetLeeway = timedelta(seconds=10)
+        activityStartTZOffsetLeeway = timedelta(minutes=1)
         timezoneErrorPeriod = timedelta(hours=38)
         from tapiriik.services.interchange import ActivityType
         for act in svcActivities:
@@ -429,11 +452,18 @@ class SynchronizationTask:
             if hasattr(act, "ServiceData") and act.ServiceData is not None:
                 act.ServiceDataCollection[conn._id] = act.ServiceData
                 del act.ServiceData
+            else:
+                act.ServiceDataCollection[conn._id] = None
             if act.TZ and not hasattr(act.TZ, "localize"):
                 raise ValueError("Got activity with TZ type " + str(type(act.TZ)) + " instead of a pytz timezone")
             # Used to ensureTZ() right here - doubt it's needed any more?
-            existElsewhere = [
-                              x for x in self._activities if
+            # Binsearch to find which activities actually need individual attention.
+            # Otherwise it's O(mn^2).
+            # self._activities is sorted most recent first
+            relevantActivitiesStart = bisect.bisect_left(self._activities, act.StartTime + timezoneErrorPeriod)
+            relevantActivitiesEnd = bisect.bisect_right(self._activities, act.StartTime - timezoneErrorPeriod, lo=relevantActivitiesStart)
+            extantActIter = (
+                              x for x in (self._activities[idx] for idx in range(relevantActivitiesStart, relevantActivitiesEnd)) if
                               (
                                   # Identical
                                   x.UID == act.UID
@@ -474,9 +504,14 @@ class SynchronizationTask:
                                 and
                                 # Prevents closely-spaced activities of known different type from being lumped together - esp. important for manually-enetered ones
                                 (x.Type == ActivityType.Other or act.Type == ActivityType.Other or x.Type == act.Type or ActivityType.AreVariants([act.Type, x.Type]))
-                              ]
-            if len(existElsewhere) > 0:
-                existingActivity = existElsewhere[0]
+                              )
+
+            try:
+                existingActivity = next(extantActIter)
+            except StopIteration:
+                existingActivity = None
+
+            if existingActivity:
                 # we don't merge the exclude values here, since at this stage the services have the option of just not returning those activities
                 if act.TZ is not None and existingActivity.TZ is None:
                     existingActivity.TZ = act.TZ
@@ -515,7 +550,7 @@ class SynchronizationTask:
                 act.UIDs = existingActivity.UIDs  # stop the circular inclusion, not that it matters
                 continue
             if not no_add:
-                self._activities.append(act)
+                bisect.insort_left(self._activities, act)
 
     def _determineEligibleRecipientServices(self, activity, recipientServices):
         from tapiriik.auth import User
@@ -552,7 +587,7 @@ class SynchronizationTask:
             # ReceivesNonGPSActivitiesWithOtherSensorData doesn't matter if the activity is stationary.
             # (and the service accepts stationary activities - guaranteed immediately above)
             if not activity.Stationary:
-                if not (destSvc.ReceivesNonGPSActivitiesWithOtherSensorData or activity.GPS):
+                if not (destSvc.ReceivesNonGPSActivitiesWithOtherSensorData or activity.GPS is not False):
                     logger.info("\t\t" + destSvc.ID + " doesn't receive non-GPS activities")
                     activity.Record.MarkAsNotPresentOn(destinationSvcRecord, UserException(UserExceptionType.NonGPSUnsupported))
                     continue
@@ -612,6 +647,12 @@ class SynchronizationTask:
             self._excludeService(conn, UserException(UserExceptionType.Other))
             return
 
+        if exhaustive and not svc.SupportsExhaustiveListing and not self._activities:
+            # If we get to this point, we must already have activity listings from another service.
+            logger.info("Account does not contain any services supporting exhaustive activity listing")
+            self._excludeService(conn, UserException(UserExceptionType.Other))
+            return
+
         if svc.RequiresExtendedAuthorizationDetails:
             if not conn.ExtendedAuthorization:
                 logger.info("No extended auth details for " + svc.ID)
@@ -620,7 +661,10 @@ class SynchronizationTask:
 
         try:
             logger.info("\tRetrieving list from " + svc.ID)
-            svcActivities, svcExclusions = svc.DownloadActivityList(conn, exhaustive)
+            if not exhaustive or not self._activities:
+                svcActivities, svcExclusions = svc.DownloadActivityList(conn, exhaustive)
+            else:
+                svcActivities, svcExclusions = svc.DownloadActivityList(conn, min((x.StartTime.replace(tzinfo=None) for x in self._activities)))
         except (ServiceException, ServiceWarning) as e:
             # Special-case rate limiting errors thrown during listing
             # Otherwise, things will melt down when the limit is reached
@@ -639,7 +683,7 @@ class SynchronizationTask:
             if not _isWarning(e):
                 return
         except Exception as e:
-            self._syncErrors[conn._id].append({"Step": SyncStep.List, "Message": _formatExc()})
+            self._syncErrors[conn._id].append(_packException(SyncStep.List))
             self._excludeService(conn, UserException(UserExceptionType.ListingError))
             return
         self._accumulateExclusions(conn, svcExclusions)
@@ -677,9 +721,18 @@ class SynchronizationTask:
 
         if updateServicesWithExistingActivity:
             logger.debug("\t\tUpdating SynchronizedActivities")
-            db.connections.update({"_id": {"$in": list(activity.ServiceDataCollection.keys())}},
-                                  {"$addToSet": {"SynchronizedActivities": {"$each": list(activity.UIDs)}}},
-                                  multi=True)
+            try:
+                db.connections.update({"_id": {"$in": list(activity.ServiceDataCollection.keys())}},
+                                      {"$addToSet": {"SynchronizedActivities": {"$each": list(activity.UIDs)}}},
+                                      multi=True)
+            except pymongo.errors.WriteError as e:
+                if e.code == 17419: # Update makes document too large.
+                    # Throw them all out - exhaustive sync will recover.
+                    # I should probably check that this is actually due to transient issues - otherwise it'll keep happening.
+                    db.connections.update({"_id": {"$in": list(activity.ServiceDataCollection.keys())}}, {"$unset": {"SynchronizedActivities": ""}})
+                    self._sync_result.ForceExhaustive = True
+                else:
+                    raise
 
     def _updateActivityRecordInitialPrescence(self, activity):
         for connWithExistingActivityId in activity.ServiceDataCollection.keys():
@@ -714,6 +767,10 @@ class SynchronizationTask:
         for dlSvcRecord in actAvailableFromSvcs:
             dlSvc = dlSvcRecord.Service
             logger.info("\tfrom " + dlSvc.ID)
+            if not dlSvc.SuppliesActivities:
+                activity.Record.MarkAsNotPresentOtherwise(UserException(UserExceptionType.NoSupplier))
+                logger.info("\t\t...does not supply activities")
+                continue
             if activity.UID in self._syncExclusions[dlSvcRecord._id]:
                 activity.Record.MarkAsNotPresentOtherwise(_unpackUserException(self._syncExclusions[dlSvcRecord._id][activity.UID]))
                 logger.info("\t\t...has activity exclusion logged")
@@ -757,7 +814,7 @@ class SynchronizationTask:
                 activity.Record.MarkAsNotPresentOtherwise(e.UserException)
                 continue
             except Exception as e:
-                packed_exc = {"Step": SyncStep.Download, "Message": _formatExc()}
+                packed_exc = _packException(SyncStep.Download)
 
                 activity.Record.IncrementFailureCount(dlSvcRecord)
                 if activity.Record.GetFailureCount(dlSvcRecord) >= dlSvc.DownloadRetryCount:
@@ -810,7 +867,7 @@ class SynchronizationTask:
                 activity.Record.MarkAsNotPresentOn(destinationServiceRec, e.UserException if e.UserException else UserException(UserExceptionType.UploadError))
                 raise UploadException()
         except Exception as e:
-            packed_exc = {"Step": SyncStep.Upload, "Message": _formatExc()}
+            packed_exc = _packException(SyncStep.Upload)
 
             activity.Record.IncrementFailureCount(destinationServiceRec)
             if activity.Record.GetFailureCount(destinationServiceRec) >= destSvc.UploadRetryCount:
@@ -831,6 +888,7 @@ class SynchronizationTask:
             return # Done and done!
 
         sync_result = SynchronizationTaskResult()
+        self._sync_result = sync_result
 
         self._user_config = User.GetConfiguration(self.user)
 
@@ -860,7 +918,12 @@ class SynchronizationTask:
 
         try:
             try:
-                for conn in self._serviceConnections:
+                # Sort services that don't support exhaustive listing last.
+                # That way, we can provide them with the proper bounds for listing based
+                # on activities from other services.
+                for conn in sorted(self._serviceConnections,
+                                   key=lambda x: x.Service.SupportsExhaustiveListing,
+                                   reverse=True):
                     # If we're not going to be doing anything anyways, stop now
                     if len(self._serviceConnections) - len(self._excludedServices) <= 1:
                         raise SynchronizationCompleteException()
@@ -911,7 +974,18 @@ class SynchronizationTask:
 
                             if tz and endtime: # We can't really know for sure otherwise
                                 time_past = (datetime.utcnow() - endtime.astimezone(pytz.utc).replace(tzinfo=None))
-                                time_past += tz.dst(endtime.replace(tzinfo=None)) if tz.dst(endtime.replace(tzinfo=None)) else timedelta(0) # For some reason DST wasn't being taken into account - maybe just GC?
+                                 # I believe astimezone(utc) is scrubbing the DST away - put it back here.
+                                 # We must try this twice because not all of our TZ objects are pytz for... some reason.
+                                 # And, thus, dst() may not accept is_dst.
+
+                                try:
+                                    dst_offset = tz.dst(endtime.replace(tzinfo=None))
+                                except pytz.AmbiguousTimeError:
+                                    dst_offset = tz.dst(endtime.replace(tzinfo=None), is_dst=False)
+
+                                if dst_offset:
+                                    time_past += dst_offset
+
                                 time_remaining = timedelta(seconds=self._user_config["sync_upload_delay"]) - time_past
                                 logger.debug(" %s since upload" % time_past)
                                 if time_remaining > timedelta(0):
@@ -1110,8 +1184,9 @@ class SynchronizationTask:
 
 
 class SynchronizationTaskResult:
-    def __init__(self, force_next_sync=None):
+    def __init__(self, force_next_sync=None, force_exhaustive=False):
         self.ForceNextSync = force_next_sync
+        self.ForceExhaustive = force_exhaustive
 
     def ForceScheduleNextSyncOnOrBefore(self, next_sync):
         self.ForceNextSync = self.ForceNextSync if self.ForceNextSync and self.ForceNextSync < next_sync else next_sync

@@ -19,6 +19,11 @@ def diag_requireAuth(view):
 
 @diag_requireAuth
 def diag_dashboard(req):
+    return redirect("diagnostics_queue_dashboard")
+
+
+@diag_requireAuth
+def diag_queue_dashboard(req):
     context = {}
     stats = db.stats.find_one()
 
@@ -30,13 +35,6 @@ def diag_dashboard(req):
     context["lockedSyncUsers"] = list(db.users.find({"SynchronizationWorker": {"$ne": None}}))
     context["lockedSyncRecords"] = len(context["lockedSyncUsers"])
     context["queuedUnlockedUsers"] = list(db.users.find({"SynchronizationWorker": {"$exists": False}, "QueuedAt": {"$ne": None}}))
-
-    context["pendingSynchronizations"] = db.users.find({"NextSynchronization": {"$lt": datetime.utcnow()}}).count()
-    context["pendingSynchronizationsLocked"] = db.users.find({"NextSynchronization": {"$lt": datetime.utcnow()}, "SynchronizationWorker": {"$ne": None}}).count()
-    context["pendingSynchronizationsLockedQueued"] = db.users.find({"NextSynchronization": {"$lt": datetime.utcnow()}, "QueuedAt": {"$ne": None, "$exists": True}, "SynchronizationWorker": {"$ne": None}}).count()
-    context["pendingSynchronizationsQueued"] = db.users.find({"NextSynchronization": {"$lt": datetime.utcnow()}, "QueuedAt": {"$ne": None, "$exists": True}}).count()
-    context["queuedSynchronizations"] = db.users.find({"QueuedAt": {"$lt": datetime.utcnow()}}).count()
-    context["queuedSynchronizationsLocked"] = db.users.find({"QueuedAt": {"$lt": datetime.utcnow()}, "SynchronizationWorker": {"$ne": None}}).count()
 
     context["userCt"] = db.users.count()
     context["scheduledCt"] = db.users.find({"$or":[{"NextSynchronization": {"$ne": None, "$exists": True}}, {"QueuedAt": {"$ne": None, "$exists": True}}]}).count()
@@ -82,16 +80,16 @@ def diag_dashboard(req):
         db.users.update({"QueuedAt": {"$lt": datetime.utcnow()}, "$or": [{"SynchronizationWorker": {"$exists": False}}, {"SynchronizationWorker": None}]}, {"$set": {"NextSynchronization": datetime.utcnow(), "QueuedGeneration": "manual"}, "$unset": {"QueuedAt": True}}, multi=True)
 
     if delta:
-        return redirect("diagnostics_dashboard")
+        return redirect("diagnostics_queue_dashboard")
 
     return render(req, "diag/dashboard.html", context)
 
 @diag_requireAuth
 def diag_errors(req):
     context = {}
-    syncErrorListing = list(db.common_sync_errors.find({}, {"value.exemplar": 1, "value.count": 1, "value.recency_avg": 1, "_id.service": 1}).sort("value.count", -1))
+    syncErrorListing = list(db.common_sync_errors.find({"value.count": {"$gt": 5}}, {"value.exemplar": 1, "value.count": 1, "value.recency_avg": 1, "_id.service": 1}))
     syncErrorSummary = []
-    for error in syncErrorListing:    
+    for error in sorted(syncErrorListing, key=lambda error: error["value"]["count"], reverse=True):
         syncErrorSummary.append({"id": urllib.parse.quote(json.dumps(error["_id"])), "service": error["_id"]["service"], "message": error["value"]["exemplar"], "count": int(error["value"]["count"]), "average_age": error["value"].get("recency_avg", 0)})
 
     context["syncErrorSummary"] = syncErrorSummary
@@ -193,6 +191,10 @@ def diag_user(req, user):
         from tapiriik.services import Service
         svcRec = Service.GetServiceRecordByID(req.POST["id"])
         svcRec.SetPartialSyncTriggerSubscriptionState(not svcRec.PartialSyncTriggerSubscribed)
+    elif "svc_toggle_poll_trigger" in req.POST:
+        from tapiriik.services import Service
+        svcRec = Service.GetServiceRecordByID(req.POST["id"])
+        db.connections.update({"_id": ObjectId(req.POST["id"])}, {"$set": {"TriggerPartialSync": not svcRec.TriggerPartialSync}})
     elif "svc_tryagain" in req.POST:
         from tapiriik.services import Service
         svcRec = Service.GetServiceRecordByID(req.POST["id"])

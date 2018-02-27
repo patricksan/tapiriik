@@ -5,19 +5,20 @@ from tapiriik.services.stream_sampling import StreamSampler
 from tapiriik.services.auto_pause import AutoPauseCalculator
 from tapiriik.services.api import APIException, UserException, UserExceptionType, APIExcludeActivity
 from tapiriik.services.interchange import UploadedActivity, ActivityType, ActivityStatistic, ActivityStatisticUnit, WaypointType, Waypoint, Location, Lap
-from tapiriik.database import cachedb
+from tapiriik.database import cachedb, redis
 from django.core.urlresolvers import reverse
 from datetime import datetime, timedelta
 import requests
 import urllib.parse
 import json
 import logging
+import re
 logger = logging.getLogger(__name__)
 
 
 class RunKeeperService(ServiceBase):
     ID = "runkeeper"
-    DisplayName = "RunKeeper"
+    DisplayName = "Runkeeper"
     DisplayAbbreviation = "RK"
     AuthenticationType = ServiceAuthenticationType.OAuth
     UserProfileURL = "http://runkeeper.com/user/{0}/profile"
@@ -36,6 +37,7 @@ class RunKeeperService(ServiceBase):
                          "Wheelchair": ActivityType.Wheelchair,
                          "Rowing": ActivityType.Rowing,
                          "Elliptical": ActivityType.Elliptical,
+                         "Strength Training": ActivityType.StrengthTraining,
                          "Other": ActivityType.Other}
     SupportedActivities = list(_activityMappings.values())
 
@@ -43,6 +45,38 @@ class RunKeeperService(ServiceBase):
     SupportsCalories = True
 
     _wayptTypeMappings = {"start": WaypointType.Start, "end": WaypointType.End, "pause": WaypointType.Pause, "resume": WaypointType.Resume}
+    _URI_CACHE_KEY = "rk:user_uris"
+    _RATE_LIMIT_KEY = "rk:rate_limit:hit"
+
+    def _rate_limit(self, endpoint, req_lambda):
+        if redis.get(self._RATE_LIMIT_KEY) is not None:
+            raise APIException("RK global rate limit previously reached on %s" % endpoint, user_exception=UserException(UserExceptionType.RateLimited))
+        response = req_lambda()
+        if response.status_code == 429:
+            if "user" not in response.text:
+                # When we hit a limit we preemptively fail all future requests till we're sure
+                # than the limit is expired. The maximum period appears to be 1 day.
+                # This entire thing is an excercise in better-safe-than-sorry as it's unclear
+                # how their rate-limit logic works (when limits reset, etc).
+
+                # As it turns out, there are several parallel rate limits operating at once.
+                # Attempt to parse out how long we should wait - if we can't figure it out,
+                # default to the shortest time I've seen (15m). As long as the timer doesn't reset
+                # every time you request during the over-quota period, this should work.
+                timeout = timedelta(minutes=15)
+                timeout_match = re.search(r"(\d+) (second|minute|hour|day)", response.text)
+                if timeout_match:
+                    # This line is too clever for its own good.
+                    timeout = timedelta(**{"%ss" % timeout_match.group(2): float(timeout_match.group(1))})
+
+                redis.setex(self._RATE_LIMIT_KEY, response.text, timeout)
+                raise APIException("RK global rate limit reached on %s" % endpoint, user_exception=UserException(UserExceptionType.RateLimited))
+            else:
+                # Per-user limit hit: don't halt entire system, just bail for this user
+                # If a user has too many pages of activities, they will never sync as we'll keep hitting the limit.
+                # But that's a Very Hard Problem to Solve™ given that I can't do incremental listings...
+                raise APIException("RK user rate limit reached on %s" % endpoint, user_exception=UserException(UserExceptionType.RateLimited))
+        return response
 
     def WebInit(self):
         self.UserAuthorizationURL = "https://runkeeper.com/apps/authorize?client_id=" + RUNKEEPER_CLIENT_ID + "&response_type=code&redirect_uri=" + WEB_ROOT + reverse("oauth_return", kwargs={"service": "runkeeper"})
@@ -54,49 +88,65 @@ class RunKeeperService(ServiceBase):
         code = req.GET.get("code")
         params = {"grant_type": "authorization_code", "code": code, "client_id": RUNKEEPER_CLIENT_ID, "client_secret": RUNKEEPER_CLIENT_SECRET, "redirect_uri": WEB_ROOT + reverse("oauth_return", kwargs={"service": "runkeeper"})}
 
-        response = requests.post("https://runkeeper.com/apps/token", data=urllib.parse.urlencode(params), headers={"Content-Type": "application/x-www-form-urlencoded"})
+        response = self._rate_limit("auth_token",
+                                    lambda: requests.post("https://runkeeper.com/apps/token",
+                                                          data=urllib.parse.urlencode(params),
+                                                          headers={"Content-Type": "application/x-www-form-urlencoded"}))
+
         if response.status_code != 200:
             raise APIException("Invalid code")
         token = response.json()["access_token"]
 
-        # hacky, but also totally their fault for not giving the user id in the token req
-        existingRecord = Service.GetServiceRecordWithAuthDetails(self, {"Token": token})
-        if existingRecord is None:
-            uid = self._getUserId(ServiceRecord({"Authorization": {"Token": token}}))  # meh
-        else:
-            uid = existingRecord.ExternalID
+        # This used to check with GetServiceRecordWithAuthDetails but that's hideously slow on an unindexed field.
+        uid = self._getUserId(ServiceRecord({"Authorization": {"Token": token}}))  # meh
 
         return (uid, {"Token": token})
 
     def RevokeAuthorization(self, serviceRecord):
-        resp = requests.post("https://runkeeper.com/apps/de-authorize", data={"access_token": serviceRecord.Authorization["Token"]})
+        resp = self._rate_limit("revoke_token",
+                                lambda: requests.post("https://runkeeper.com/apps/de-authorize",
+                                                      data={"access_token": serviceRecord.Authorization["Token"]}))
         if resp.status_code != 204 and resp.status_code != 200:
             raise APIException("Unable to deauthorize RK auth token, status " + str(resp.status_code) + " resp " + resp.text)
         pass
 
     def _apiHeaders(self, serviceRecord):
-        return {"Authorization": "Bearer " + serviceRecord.Authorization["Token"]}
+        return {"Authorization": "Bearer " + serviceRecord.Authorization["Token"],
+                "Accept-Charset": "UTF-8"}
 
     def _getAPIUris(self, serviceRecord):
         if hasattr(self, "_uris"):  # cache these for the life of the batch job at least? hope so
             return self._uris
         else:
-            response = requests.get("https://api.runkeeper.com/user/", headers=self._apiHeaders(serviceRecord))
+            uris_json = redis.get(self._URI_CACHE_KEY)
+            if uris_json is not None:
+                uris = json.loads(uris_json.decode('utf-8'))
+            else:
+                response = self._rate_limit("user",
+                                            lambda: requests.get("https://api.runkeeper.com/user/",
+                                                                 headers=self._apiHeaders(serviceRecord)))
+                if response.status_code != 200:
+                    if response.status_code == 401 or response.status_code == 403:
+                        raise APIException("No authorization to retrieve user URLs", block=True, user_exception=UserException(UserExceptionType.Authorization, intervention_required=True))
+                    raise APIException("Unable to retrieve user URLs" + str(response))
 
-            if response.status_code != 200:
-                if response.status_code == 401 or response.status_code == 403:
-                    raise APIException("No authorization to retrieve user URLs", block=True, user_exception=UserException(UserExceptionType.Authorization, intervention_required=True))
-                raise APIException("Unable to retrieve user URLs" + str(response))
-
-            uris = response.json()
-            for k in uris.keys():
-                if type(uris[k]) == str:
-                    uris[k] = "https://api.runkeeper.com" + uris[k]
+                uris = response.json()
+                for k in uris.keys():
+                    if type(uris[k]) == str:
+                        uris[k] = "https://api.runkeeper.com" + uris[k]
+                # Runkeeper wants you to request these on a per-user basis.
+                # In practice, the URIs are identical for ever user (only the userID key changes).
+                # So, only do it once every 24 hours, across the entire system.
+                redis.setex(self._URI_CACHE_KEY, json.dumps(uris), timedelta(hours=24))
             self._uris = uris
             return uris
 
     def _getUserId(self, serviceRecord):
-        resp = requests.get("https://api.runkeeper.com/user/", headers=self._apiHeaders(serviceRecord))
+        resp = self._rate_limit("user",
+                                lambda: requests.get("https://api.runkeeper.com/user/",
+                                                     headers=self._apiHeaders(serviceRecord)))
+        if resp.status_code != 200:
+            raise APIException("Failed to retrieve RK user metadata %s: %s" % (resp.status_code, resp.text))
         data = resp.json()
         return data["userID"]
 
@@ -108,7 +158,9 @@ class RunKeeperService(ServiceBase):
         pageUri = uris["fitness_activities"]
 
         while True:
-            response = requests.get(pageUri, headers=self._apiHeaders(serviceRecord))
+            response = self._rate_limit("list",
+                                        lambda: requests.get(pageUri,
+                                                             headers=self._apiHeaders(serviceRecord)))
             if response.status_code != 200:
                 if response.status_code == 401 or response.status_code == 403:
                     raise APIException("No authorization to retrieve activity list", block=True, user_exception=UserException(UserExceptionType.Authorization, intervention_required=True))
@@ -150,7 +202,8 @@ class RunKeeperService(ServiceBase):
         activity.Stats.Energy = ActivityStatistic(ActivityStatisticUnit.Kilocalories, value=rawRecord["total_calories"] if "total_calories" in rawRecord else None)
         if rawRecord["type"] in self._activityMappings:
             activity.Type = self._activityMappings[rawRecord["type"]]
-        activity.GPS = rawRecord["has_path"]
+        activity.GPS = rawRecord["has_path"] and rawRecord['tracking_mode'] == "outdoor"
+        activity.Stationary = not rawRecord["has_path"]
         activity.CalculateUID()
         return activity
 
@@ -159,7 +212,9 @@ class RunKeeperService(ServiceBase):
         if AGGRESSIVE_CACHE:
             ridedata = cachedb.rk_activity_cache.find_one({"uri": activityID})
         if not AGGRESSIVE_CACHE or ridedata is None:
-            response = requests.get("https://api.runkeeper.com" + activityID, headers=self._apiHeaders(serviceRecord))
+            response = self._rate_limit("download",
+                                        lambda: requests.get("https://api.runkeeper.com" + activityID,
+                                                             headers=self._apiHeaders(serviceRecord)))
             if response.status_code != 200:
                 if response.status_code == 401 or response.status_code == 403:
                     raise APIException("No authorization to download activity" + activityID, block=True, user_exception=UserException(UserExceptionType.Authorization, intervention_required=True))
@@ -205,19 +260,21 @@ class RunKeeperService(ServiceBase):
         def _addWaypoint(timestamp, path=None, heart_rate=None, calories=None, distance=None):
             waypoint = Waypoint(activity.StartTime + timedelta(seconds=timestamp))
             if path:
-                waypoint.Location = Location(path["latitude"], path["longitude"], path["altitude"] if "altitude" in path and float(path["altitude"]) != 0 else None)  # if you're running near sea level, well...
+                if path["latitude"] != 0 and path["longitude"] != 0:
+                    waypoint.Location = Location(path["latitude"], path["longitude"], path["altitude"] if "altitude" in path and float(path["altitude"]) != 0 else None)  # if you're running near sea level, well...
                 waypoint.Type = self._wayptTypeMappings[path["type"]] if path["type"] in self._wayptTypeMappings else WaypointType.Regular
             waypoint.HR = heart_rate
             waypoint.Calories = calories
             waypoint.Distance = distance
 
             lap.Waypoints.append(waypoint)
+        StreamSampler.SampleWithCallback(_addWaypoint, streamData)
+
         activity.Stationary = len(lap.Waypoints) == 0
+        activity.GPS = any(wp.Location and wp.Location.Longitude is not None and wp.Location.Latitude is not None for wp in lap.Waypoints)
         if not activity.Stationary:
             lap.Waypoints[0].Type = WaypointType.Start
             lap.Waypoints[-1].Type = WaypointType.End
-
-        StreamSampler.SampleWithCallback(_addWaypoint, streamData)
 
     def UploadActivity(self, serviceRecord, activity):
         #  assembly dict to post to RK
@@ -225,7 +282,10 @@ class RunKeeperService(ServiceBase):
         uris = self._getAPIUris(serviceRecord)
         headers = self._apiHeaders(serviceRecord)
         headers["Content-Type"] = "application/vnd.com.runkeeper.NewFitnessActivity+json"
-        response = requests.post(uris["fitness_activities"], headers=headers, data=json.dumps(uploadData))
+        response = self._rate_limit("upload",
+                                    lambda: requests.post(uris["fitness_activities"],
+                                                          headers=headers,
+                                                          data=json.dumps(uploadData)))
 
         if response.status_code != 201:
             if response.status_code == 401 or response.status_code == 403:
@@ -252,8 +312,14 @@ class RunKeeperService(ServiceBase):
             record["total_calories"] = activity.Stats.Energy.asUnits(ActivityStatisticUnit.Kilocalories).Value
         if activity.Stats.Distance.Value is not None:
             record["total_distance"] = activity.Stats.Distance.asUnits(ActivityStatisticUnit.Meters).Value
-        if activity.Name:
-            record["notes"] = activity.Name  # not symetric, but better than nothing
+
+        if activity.Name and activity.Notes and activity.Name != activity.Notes:
+            record["notes"] = activity.Name + " - " + activity.Notes
+        elif activity.Notes:
+            record["notes"] = activity.Notes
+        elif activity.Name:
+            record["notes"] = activity.Name
+
         if activity.Private:
             record["share"] = "Just Me"
 
@@ -318,6 +384,8 @@ class RunKeeperService(ServiceBase):
 
     def DeleteActivity(self, serviceRecord, uri):
         headers = self._apiHeaders(serviceRecord)
-        del_res = requests.delete("https://api.runkeeper.com/%s" % uri, headers=headers)
+        del_res = self._rate_limit("delete",
+                                   lambda: requests.delete("https://api.runkeeper.com/%s" % uri,
+                                                           headers=headers))
         del_res.raise_for_status()
 

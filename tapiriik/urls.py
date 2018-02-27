@@ -13,7 +13,6 @@ urlpatterns = patterns('',
     url(r'^auth/redirect/(?P<service>[^/]+)/(?P<level>.+)$', 'tapiriik.web.views.oauth.authredirect', {}, name='oauth_redirect', ),
     url(r'^auth/return/(?P<service>[^/]+)$', 'tapiriik.web.views.oauth.authreturn', {}, name='oauth_return', ),
     url(r'^auth/return/(?P<service>[^/]+)/(?P<level>.+)$', 'tapiriik.web.views.oauth.authreturn', {}, name='oauth_return', ),  # django's URL magic couldn't handle the equivalent regex
-    url(r'^auth/deauth/(?P<service>.+)$', 'tapiriik.web.views.oauth.deauth', {}, name='oauth_deauth', ),
     url(r'^auth/login/(?P<service>.+)$', 'tapiriik.web.views.auth_login', {}, name='auth_simple', ),
     url(r'^auth/login-ajax/(?P<service>.+)$', 'tapiriik.web.views.auth_login_ajax', {}, name='auth_simple_ajax', ),
     url(r'^auth/persist-ajax/(?P<service>.+)$', 'tapiriik.web.views.auth_persist_extended_auth_ajax', {}, name='auth_persist_extended_auth_ajax', ),
@@ -49,6 +48,7 @@ urlpatterns = patterns('',
     url(r'^sync/remote_callback/trigger_partial_sync/(?P<service>.+)$', 'tapiriik.web.views.sync_trigger_partial_sync_callback', {}, name='sync_trigger_partial_sync_callback'),
 
     url(r'^diagnostics/$', 'tapiriik.web.views.diag_dashboard', {}, name='diagnostics_dashboard'),
+    url(r'^diagnostics/queue$', 'tapiriik.web.views.diag_queue_dashboard', {}, name='diagnostics_queue_dashboard'),
     url(r'^diagnostics/errors$', 'tapiriik.web.views.diag_errors', {}, name='diagnostics_errors'),
     url(r'^diagnostics/error/(?P<error>.+)$', 'tapiriik.web.views.diag_error', {}, name='diagnostics_error'),
     url(r'^diagnostics/graphs$', 'tapiriik.web.views.diag_graphs', {}, name='diagnostics_graphs'),
@@ -74,8 +74,6 @@ urlpatterns = patterns('',
     url(r'^ab/begin/(?P<key>[^/]+)$', 'tapiriik.web.views.ab_web_experiment_begin', {}, name='ab_web_experiment_begin'),
 
     url(r'^privacy$', 'tapiriik.web.views.privacy.privacy', name='privacy'),
-
-    url(r'^trainingpeaks_premium$', 'tapiriik.web.views.trainingpeaks_premium.trainingpeaks_premium', name='trainingpeaks_premium'),
 
     url(r'^garmin_connect_users$', TemplateView.as_view(template_name='static/garmin_connect_users.html'), name='garmin_connect_users'),
 

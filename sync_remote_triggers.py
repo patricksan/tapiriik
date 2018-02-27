@@ -15,10 +15,10 @@ celery_app = Celery('sync_remote_triggers', broker=RABBITMQ_BROKER_URL)
 celery_app.config_from_object(_celeryConfig())
 
 @worker_shutdown.connect
-def celery_shutdown():
+def celery_shutdown(**kwargs):
     close_connections()
 
-@celery_app.task()
+@celery_app.task(acks_late=True)
 def trigger_remote(service_id, affected_connection_external_ids):
     from tapiriik.auth import User
     from tapiriik.services import Service

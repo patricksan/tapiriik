@@ -69,6 +69,7 @@ STATICFILES_DIRS = (
 STATICFILES_FINDERS = (
     'django.contrib.staticfiles.finders.FileSystemFinder',
     'django.contrib.staticfiles.finders.AppDirectoriesFinder',
+    'pipeline.finders.PipelineFinder',
 #    'django.contrib.staticfiles.finders.DefaultStorageFinder',
 )
 
@@ -206,6 +207,7 @@ MONGO_CLIENT_OPTIONS = {}
 MONGO_FULL_WRITE_CONCERN = 1
 
 REDIS_HOST = "localhost"
+REDIS_CLIENT_OPTIONS = {}
 
 WEB_ROOT = 'http://localhost:8000'
 
